@@ -1,7 +1,7 @@
 import json
 import re
 
-from localstack.services.apigateway.templates import ApiGatewayVtlTemplate
+from localstack.services.apigateway.legacy.templates import ApiGatewayVtlTemplate
 from localstack.utils.aws.templating import render_velocity_template
 
 # template used to transform incoming requests at the API Gateway (forward to Kinesis)
@@ -32,8 +32,8 @@ APIGW_TEMPLATE_CONSTRUCT_JSON = """
 {
     #foreach($key in $map.keySet())
         #set( $k = $util.escapeJavaScript($key) )
-        #set( $v = $util.escapeJavaScript($map.get($key)).replaceAll("\\\\'", "'") )
-        $k: $v
+        #set( $v = $util.escapeJavaScript($map.get($key)))
+        "$k": "$v"
         #if( $foreach.hasNext ) , #end
     #end
 }
@@ -139,19 +139,36 @@ class TestMessageTransformationBasic:
         #end
         #return('end')
         """
-        result = render_velocity_template(template, {"context": dict()})
+        result = render_velocity_template(template, {"context": {}})
         result = re.sub(r"\s+", " ", result).strip()
         assert result == "loop1 loop3 end"
+
+    def test_put_value_to_dict(self):
+        template = r"""
+        $util.qr($ctx.test.put("foo", "bar"))
+        $ctx.test
+        """
+        result = render_velocity_template(template, {"ctx": {"test": {}}})
+        assert result.strip() == str({"foo": "bar"})
+
+    def test_put_value_to_nested_dict(self):
+        template = r"""
+        $ctx.test.get('a').get('b').put('foo', 'bar')
+        $ctx.test.get('a')
+        """
+        wrapped = {"a": {"b": {"c": "foobar"}}}
+        result = render_velocity_template(template, {"ctx": {"test": wrapped}})
+        assert result.strip() == str({"b": {"c": "foobar", "foo": "bar"}})
 
 
 class TestMessageTransformationApiGateway:
     def test_construct_json_using_define(self):
         template = APIGW_TEMPLATE_CONSTRUCT_JSON
-        data = {"p1": {"test": 123}, "p2": {"foo": "bar", "foo2": False}}
-        variables = {"input": {"body": data}}
-        result = ApiGatewayVtlTemplate().render_vtl(template, variables).strip()
+        variables = {"input": {"body": {"p1": {"test": 123}, "p2": {"foo": "bar", "foo2": False}}}}
+        result = ApiGatewayVtlTemplate().render_vtl(template, variables)
+        result = re.sub(r"\s+", " ", result).strip()
         result = json.loads(result)
-        assert result == {"p0": True, **data}
+        assert result == {"p0": True, "p1": {"test": "123"}, "p2": {"foo": "bar", "foo2": "false"}}
 
     def test_array_size(self):
         template = "#set($list = $input.path('$.records')) $list.size()"
@@ -205,9 +222,17 @@ class TestMessageTransformationApiGateway:
         variables = {"input": {"body": context}}
         template1 = "${foo.bar.strip().lower().replace(' ','-')}"
         template2 = "${foo.bar.trim().toLowerCase().replace(' ','-')}"
-        for template in [template1, template2]:
+        template3 = "${foo.bar.toString().lower().replace(' ','-')}"
+        template4 = '${foo.bar.trim().toLowerCase().replaceAll("^(.*)\\s(.*)$","$1-$2")}'
+        for template in [template1, template2, template3, template4]:
             result = ApiGatewayVtlTemplate().render_vtl(template, variables=variables)
             assert result == "baz-baz"
+
+        contains_template1 = ("${foo.bar.toString().lower().contains('baz')}", "true")
+        contains_template2 = ("${foo.bar.toString().lower().contains('bar')}", "false")
+        for template, expected_result in [contains_template1, contains_template2]:
+            result = ApiGatewayVtlTemplate().render_vtl(template, variables=variables)
+            assert result == expected_result
 
     def test_render_urlencoded_string_data(self):
         template = "MessageBody=$util.base64Encode($input.json('$'))"
@@ -221,3 +246,32 @@ class TestMessageTransformationApiGateway:
         variables = {"input": {"body": body}}
         result = ApiGatewayVtlTemplate().render_vtl(template, variables)
         assert result == " b"
+
+    def test_dash_in_variable_name(self):
+        template = "#set($start = 1)#set($end = 5)#foreach($i in [$start .. $end])$i -#end"
+        result = ApiGatewayVtlTemplate().render_vtl(template, {})
+        assert result == "1 -2 -3 -4 -5 -"
+
+        template = """
+         $method.request.header.X-My-Header
+        """
+        variables = {"method": {"request": {"header": {"X-My-Header": "my-header-value"}}}}
+        result = ApiGatewayVtlTemplate().render_vtl(template, variables).strip()
+        assert result == "my-header-value"
+
+    def test_boolean_in_variable(self):
+        # Inspired by authorizer context from Lambda authorizer:
+        # https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-lambda-authorizer-output.html
+        # The returned values are all stringified. Notice that you cannot set a JSON
+        # object or array as a valid value of any key in the context map.
+        template = '{"booleanKeyTrue": $booleanKeyTrue, "booleanKeyFalse": $booleanKeyFalse}'
+        variables = {
+            "booleanKeyTrue": "true",
+            "booleanKeyFalse": "false",
+        }
+        result = ApiGatewayVtlTemplate().render_vtl(template, variables)
+        assert "true" in result
+        assert "false" in result
+        assert result == '{"booleanKeyTrue": true, "booleanKeyFalse": false}'
+        # test is valid json
+        json.loads(result)
